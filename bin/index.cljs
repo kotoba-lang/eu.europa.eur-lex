@@ -1,0 +1,166 @@
+#!/usr/bin/env nbb
+;; Derives index/ (small, git-tracked) from raw/ (large, annexed).
+;;
+;;   index/laws.edn       — one row per in-force CELEX act
+;;   index/relations.edn  — the structural act-to-act dependency edges
+;;   raw/source-catalog.edn — sha256 of every preserved file
+;;
+;; Usage: nbb --classpath bin bin/index.cljs
+(ns index
+  (:require [lib :refer [log write-edn! sha256-file file-size mkdirp!]]
+            [clojure.string :as str]))
+
+(def fs (js/require "fs"))
+(def raw "raw")
+
+(defn read-json [p] (js/JSON.parse (.toString (.readFileSync fs p))))
+
+(defn pages [prefix]
+  (->> (.readdirSync fs (str raw "/sparql"))
+       (filter #(str/starts-with? % (str prefix "-")))
+       ;; "metadata-" must not also match "metadata-extra-..."; the numeric
+       ;; suffix check keeps a prefix from swallowing a longer sibling name.
+       (filter #(re-matches #".*-\d+\.json$" %))
+       (filter #(= prefix (str/replace % #"-\d+\.json$" "")))
+       sort
+       (map #(str raw "/sparql/" %))))
+
+(defn bindings [p]
+  (array-seq (.. (read-json p) -results -bindings)))
+
+(defn v [^js b k]
+  (when-let [x (aget b k)] (.-value x)))
+
+(def resource-type->kind
+  {"REG" :law.kind/regulation
+   "REG_IMPL" :law.kind/implementing-regulation
+   "REG_DEL" :law.kind/delegated-regulation
+   "REG_FINANC" :law.kind/regulation
+   "DIR" :law.kind/directive
+   "DIR_IMPL" :law.kind/implementing-directive
+   "DIR_DEL" :law.kind/delegated-directive
+   "DEC" :law.kind/decision
+   "DEC_IMPL" :law.kind/implementing-decision
+   "DEC_DEL" :law.kind/delegated-decision
+   "DEC_ENTSCHEID" :law.kind/decision
+   "DEC_ADOPT_INTERNATION" :law.kind/decision
+   "TREATY" :law.kind/treaty
+   "AGREE_INTERNATION" :law.kind/international-agreement
+   "RECO" :law.kind/recommendation
+   "OPIN" :law.kind/opinion
+   "RES" :law.kind/resolution
+   "PROT" :law.kind/protocol})
+
+(def relation-kinds
+  {"relations-amends" :law.rel/amends
+   "relations-repeals" :law.rel/repeals
+   "relations-implicitly-repeals" :law.rel/implicitly-repeals
+   "relations-based-on" :law.rel/based-on
+   "relations-completes" :law.rel/completes
+   "relations-corrects" :law.rel/corrects
+   "relations-codified-version" :law.rel/codified-as})
+
+(defn text-meta [celex]
+  (let [p (str raw "/text/" celex ".xhtml")
+        mp (str p ".meta")]
+    (when (.existsSync fs p)
+      (let [[lang media] (if (.existsSync fs mp)
+                           (str/split (str/trim (.toString (.readFileSync fs mp))) #"\s+")
+                           ;; Files written before .meta existed are the
+                           ;; English XHTML manifestation by construction --
+                           ;; that was the only combination the first run
+                           ;; ever requested. Recorded, not guessed.
+                           ["eng" "application/xhtml+xml"])]
+        {:text/path p
+         :text/sha256 (sha256-file p)
+         :text/bytes (file-size p)
+         :text/lang lang
+         :text/format media}))))
+
+(defn -main []
+  (let [meta-rows
+        (->> (pages "metadata")
+             (mapcat bindings)
+             (map (fn [b]
+                    (let [celex (v b "celex")
+                          rt (some-> (v b "type") (str/split #"/") last)]
+                      (cond-> {:law/key (str "eu-celex:" celex)
+                               :law/jurisdiction "EU"
+                               :law/source-id "eu-eur-lex"
+                               :law/local-id celex
+                               :law/kind (get resource-type->kind rt :law.kind/other)
+                               :law/resource-type rt
+                               :law/status :law.status/in-force
+                               :law/lang "en"
+                               :law/url (str "https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:" celex)}
+                        (v b "title") (assoc :law/title (v b "title"))
+                        (v b "date") (assoc :law/promulgated-at (v b "date"))
+                        (v b "eli") (assoc :law/eli (v b "eli"))))))
+             ;; One CELEX can produce several bindings (multiple language
+             ;; expressions, several ELIs). Collapse on the key and prefer the
+             ;; row that carries a title.
+             (reduce (fn [acc r]
+                       (let [k (:law/key r)
+                             prev (get acc k)]
+                         (if (and prev (:law/title prev)) acc (assoc acc k (merge prev r)))))
+                     {})
+             vals
+             (map (fn [r] (if-let [t (text-meta (:law/local-id r))] (merge r t) r)))
+             (sort-by :law/key)
+             vec)
+
+        edges
+        (->> relation-kinds
+             (mapcat (fn [[prefix kind]]
+                       (->> (pages prefix)
+                            (mapcat bindings)
+                            (keep (fn [b]
+                                    (let [f (v b "from") t (v b "to")]
+                                      (when (and f t (not= f t))
+                                        {:rel/from (str "eu-celex:" f)
+                                         :rel/to (str "eu-celex:" t)
+                                         :rel/kind kind
+                                         :rel/provenance :from-metadata
+                                         :rel/source-id "eu-eur-lex"})))))))
+             distinct
+             (sort-by (juxt :rel/from :rel/kind :rel/to))
+             vec)
+
+        with-text (filter :text/path meta-rows)]
+    (mkdirp! "index")
+    (write-edn! "index/laws.edn"
+                {:index/id "eu.europa.eur-lex"
+                 :index/jurisdiction "EU"
+                 :index/source-id "eu-eur-lex"
+                 :laws meta-rows})
+    (write-edn! "index/relations.edn"
+                {:index/id "eu.europa.eur-lex"
+                 :index/source-id "eu-eur-lex"
+                 :relations edges})
+    (write-edn! (str raw "/source-catalog.edn")
+                {:catalog/id "eu.europa.eur-lex"
+                 :catalog/source-domain "publications.europa.eu"
+                 :catalog/api "Cellar SPARQL (webapi/rdf/sparql) + Cellar REST resource/celex"
+                 :catalog/license "Commission Decision 2011/833/EU — reuse of Commission documents permitted, attribution required"
+                 :catalog/license-tier :tier/a
+                 :catalog/scope "metadata + structural dependency edges for every act in force; full text for every DIRECTIVE in force"
+                 :catalog/complete-as-a-class true
+                 :catalog/class "directives in force (text layer); acts in force (metadata + edge layer)"
+                 :catalog/known-gaps
+                 [{:gap :cdm-work_cites_work
+                   :note "generic citation edges are an order of magnitude larger than all structural predicates combined and are citations, not dependencies; not extracted in wave 1"}
+                  {:gap :regulation-full-text
+                   :note "regulations in force (~6,600 base + ~9,400 implementing/delegated) have metadata and edges but no preserved text yet"}]
+                 :catalog/files
+                 (into (vec (for [p (sort (concat (pages "metadata")
+                                                  (mapcat pages (keys relation-kinds))
+                                                  (pages "directives-in-force")))]
+                              {:path p :sha256 (sha256-file p) :bytes (file-size p) :kind :sparql-page}))
+                       (map (fn [r] {:path (:text/path r) :sha256 (:text/sha256 r)
+                                     :bytes (:text/bytes r) :kind :law-text
+                                     :law-key (:law/key r) :lang (:text/lang r)}))
+                       with-text)})
+    (log "laws" (count meta-rows) "with-text" (count with-text) "edges" (count edges)
+         "text-bytes" (reduce + 0 (map :text/bytes with-text)))))
+
+(-main)

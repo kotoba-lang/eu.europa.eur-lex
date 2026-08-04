@@ -1,0 +1,253 @@
+#!/usr/bin/env nbb
+;; Preserves EUR-Lex / Cellar into raw/.
+;;
+;;   raw/sparql/metadata-<n>.json   — paged CELEX metadata (type, dates, ELI,
+;;                                    in-force flag, English title)
+;;   raw/sparql/relations-<pred>-<n>.json
+;;                                  — the STRUCTURAL act-to-act predicates,
+;;                                    one file per predicate per page. These
+;;                                    are the dependency edges: amends,
+;;                                    repeals, implicitly_repeals, based_on,
+;;                                    completes, corrects, codified_version.
+;;   raw/text/<CELEX>.xhtml         — Cellar full text, English expression
+;;
+;; Scope of the text layer (wave 1, deliberate and complete-as-a-class):
+;; every DIRECTIVE currently in force. The metadata + relation layer covers
+;; the whole in-force corpus, not just directives, because SPARQL makes that
+;; cheap and the edge graph is worthless if it stops at a class boundary.
+;;
+;; cdm:work_cites_work is NOT extracted in wave 1: it is ~an order of
+;; magnitude larger than all the structural predicates combined and is a
+;; citation, not a dependency. Recorded as a known gap rather than silently
+;; skipped.
+;;
+;; Usage: nbb --classpath bin bin/fetch.cljs [--pool N] [--limit N] [--skip-text]
+(ns fetch
+  (:require [lib :refer [fetch-buffer log mkdirp! exists? write-file! pooled
+                         sleep file-size]]
+            [clojure.string :as str]))
+
+(def endpoint "https://publications.europa.eu/webapi/rdf/sparql")
+(def raw "raw")
+
+(def args (vec *command-line-args*))
+(defn arg [flag default]
+  (if-let [i (first (keep-indexed #(when (= %2 flag) %1) args))]
+    (js/parseInt (nth args (inc i)))
+    default))
+(defn flag? [f] (some #(= f %) args))
+
+(def pool-size (arg "--pool" 5))
+(def hard-limit (arg "--limit" 0))
+(def page-size 5000)
+
+(def prefixes
+  "PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>
+   PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+   PREFIX skos: <http://www.w3.org/2004/02/skos/core#>\n")
+
+(defn sparql
+  "Runs a SPARQL query, returns a promise of {:ok true :buf b}. The endpoint
+   is slow and occasionally 500s under load, so fetch-buffer's backoff does
+   the work; a page that still fails after retries aborts the run rather
+   than silently producing a short corpus."
+  [q]
+  (let [url (str endpoint "?query=" (js/encodeURIComponent (str prefixes q))
+                 "&format=" (js/encodeURIComponent "application/sparql-results+json"))]
+    (fetch-buffer url {:tries 5})))
+
+(defn last-key
+  "The last value of ?key-var in a SPARQL JSON result page."
+  [^js j key-var]
+  (let [bs (.. j -results -bindings)
+        n (alength bs)]
+    (when (pos? n)
+      (.-value (aget (aget bs (dec n)) key-var)))))
+
+(defn paged-query!
+  "KEYSET pagination, not OFFSET. `q-fn` takes the last key seen (nil on the
+   first page) and returns a query that asks for rows strictly after it.
+
+   OFFSET paging is what a first reading of the SPARQL spec suggests, and it
+   does not work here: the Cellar Virtuoso endpoint returns HTTP 500 from
+   OFFSET 10000 onward (measured 2026-08-04 -- pages 0 and 1 succeed, page 2
+   dies), because a deep OFFSET forces it to materialise and discard every
+   preceding row. Ordering by an indexed key and filtering on it keeps every
+   page the same cost, and has the better property that a resumed run cannot
+   silently skip or duplicate rows if the underlying data shifts."
+  [name key-var q-fn]
+  (letfn [(page [n after total]
+            (let [p (str raw "/sparql/" name "-" n ".json")]
+              (if (exists? p)
+                ;; resume: trust an already-written page, count it, move on
+                (let [j (js/JSON.parse (.toString (.readFileSync (js/require "fs") p)))
+                      c (alength (.. j -results -bindings))]
+                  (log name "page" n "cached" c)
+                  (if (< c page-size)
+                    (js/Promise.resolve (+ total c))
+                    (page (inc n) (last-key j key-var) (+ total c))))
+                (-> (sparql (q-fn after))
+                    (.then (fn [{:keys [ok buf status error]}]
+                             (if-not ok
+                               (throw (js/Error. (str name " after=" after " failed: " (or status error))))
+                               (let [j (js/JSON.parse (.toString buf))
+                                     c (alength (.. j -results -bindings))]
+                                 (write-file! p buf)
+                                 (log name "page" n "rows" c "cum" (+ total c))
+                                 (if (< c page-size)
+                                   (+ total c)
+                                   (-> (sleep 500)
+                                       (.then (fn [_] (page (inc n) (last-key j key-var) (+ total c))))))))))))))]
+    (page 0 nil 0)))
+
+(defn after-filter [var after]
+  (if after (str "FILTER(str(" var ") > \"" after "\")\n") ""))
+
+;; Metadata is restricted to acts currently IN FORCE (~60k). The unrestricted
+;; set is the whole Cellar work graph (millions of rows, most of them not
+;; legislation at all) and paging it would dominate the run for no gain.
+;; Consequence, stated rather than hidden: an edge may point at a CELEX with
+;; no metadata row here, because the *source* of an amendment is often an act
+;; that has since been absorbed and is no longer in force. A CELEX id is
+;; self-describing (sector/year/type/number), so such an edge is still usable.
+(def metadata-query
+  (fn [after]
+    (str "SELECT ?celex ?type ?date ?eli ?title WHERE {
+            ?w cdm:resource_legal_id_celex ?celex .
+            ?w cdm:work_has_resource-type ?type .
+            ?w cdm:resource_legal_in-force \"true\"^^xsd:boolean .
+            " (after-filter "?celex" after) "
+            OPTIONAL { ?w cdm:work_date_document ?date }
+            OPTIONAL { ?w cdm:resource_legal_eli ?eli }
+            OPTIONAL { ?w cdm:work_has_expression ?e .
+                       ?e cdm:expression_uses_language <http://publications.europa.eu/resource/authority/language/ENG> .
+                       ?e cdm:expression_title ?title }
+          } ORDER BY ?celex LIMIT " page-size)))
+
+(def relation-predicates
+  ;; predicate-name -> cdm property. These are act-to-act STRUCTURAL edges:
+  ;; each one changes whether, or how, the target still applies.
+  {"amends"             "resource_legal_amends_resource_legal"
+   "repeals"            "resource_legal_repeals_resource_legal"
+   "implicitly-repeals" "resource_legal_implicitly_repeals_resource_legal"
+   "based-on"           "resource_legal_based_on_resource_legal"
+   "completes"          "resource_legal_completes_resource_legal"
+   "corrects"           "resource_legal_corrects_resource_legal"
+   "codified-version"   "resource_legal_codified_version"})
+
+;; ?k is a composite sort key (from + to). Paging on ?from alone would drop
+;; rows whenever one act's edge list straddles a page boundary; the composite
+;; key makes every row's position unique, so no edge can fall between pages.
+(defn relation-query [prop]
+  (fn [after]
+    (str "SELECT ?k ?from ?to WHERE {
+            ?f cdm:resource_legal_id_celex ?from .
+            ?f cdm:" prop " ?t .
+            ?t cdm:resource_legal_id_celex ?to .
+            BIND(CONCAT(str(?from), \" \", str(?to)) AS ?k)
+            " (after-filter "?k" after) "
+          } ORDER BY ?k LIMIT " page-size)))
+
+(def directives-in-force-query
+  (fn [after]
+    (str "SELECT DISTINCT ?celex WHERE {
+            ?w cdm:resource_legal_id_celex ?celex .
+            ?w cdm:work_has_resource-type <http://publications.europa.eu/resource/authority/resource-type/DIR> .
+            ?w cdm:resource_legal_in-force \"true\"^^xsd:boolean .
+            " (after-filter "?celex" after) "
+          } ORDER BY ?celex LIMIT " page-size)))
+
+(defn read-json [p]
+  (js/JSON.parse (.toString (.readFileSync (js/require "fs") p))))
+
+(defn celex-list
+  "Reads back the directive pages we just wrote and returns the CELEX ids."
+  []
+  (let [fsm (js/require "fs")
+        files (->> (.readdirSync fsm (str raw "/sparql"))
+                   (filter #(str/starts-with? % "directives-in-force-"))
+                   sort)]
+    (distinct
+     (mapcat (fn [f]
+               (let [j (read-json (str raw "/sparql/" f))]
+                 (map #(.. % -celex -value) (array-seq (.. j -results -bindings)))))
+             files))))
+
+(defn text-path [celex] (str raw "/text/" celex ".xhtml"))
+
+;; Accept-Language is NOT optional here. Cellar content-negotiates the
+;; expression, and without a language it answers 400 for every CELEX
+;; (measured 2026-08-04: 1114/1114 failed until this header was added).
+;;
+;; The fallback chain exists because language coverage is not uniform in time:
+;; directives from before the 1973 and 1995 enlargements often have no English
+;; expression at all, and asking only for eng loses 334 of 1,114 in-force
+;; directives. French and German were working languages from 1958, so the
+;; chain recovers most of the pre-accession tail. Which language each file
+;; actually is gets recorded in the index -- a consumer must never have to
+;; guess.
+;; The chain is over (media type x language), not language alone. Cellar
+;; answers 404 -- not 406 -- when the requested manifestation does not exist,
+;; and older acts frequently have only an HTML manifestation: 31962L0302 is
+;; 404 for application/xhtml+xml in every language and 200 for text/html.
+;; Asking only for XHTML lost 334 of 1,114 in-force directives on that alone.
+(def accept-chain
+  (for [mt ["application/xhtml+xml" "text/html"]
+        lang ["eng" "fra" "deu"]]
+    [mt lang]))
+
+(defn fetch-text [celex]
+  (let [p (text-path celex)]
+    (if (and (exists? p) (pos? (file-size p)))
+      (js/Promise.resolve {:celex celex :skipped true})
+      (letfn [(try-next [[[mt lang] & more] last-status]
+                (if-not mt
+                  (js/Promise.resolve {:celex celex :failed (or last-status "no-manifestation")})
+                  (-> (fetch-buffer (str "https://publications.europa.eu/resource/celex/" celex)
+                                    {:tries 2
+                                     :accept mt
+                                     :headers {"Accept-Language" lang}})
+                      (.then (fn [{:keys [ok buf status error]}]
+                               (if ok
+                                 (do (write-file! p buf)
+                                     ;; Which language/format this actually is
+                                     ;; must be recorded, never inferred.
+                                     (write-file! (str p ".meta")
+                                                  (js/Buffer.from (str lang " " mt)))
+                                     {:celex celex :bytes (.-length buf) :lang lang :media mt})
+                                 (try-next more (or status error))))))))]
+        (try-next accept-chain nil)))))
+
+(defn -main []
+  (mkdirp! (str raw "/sparql"))
+  (mkdirp! (str raw "/text"))
+  (-> (paged-query! "metadata" "celex" metadata-query)
+      (.then (fn [n] (log "metadata rows" n)
+               (reduce (fn [p [nm prop]]
+                         (.then p (fn [_] (paged-query! (str "relations-" nm) "k" (relation-query prop)))))
+                       (js/Promise.resolve nil)
+                       (sort relation-predicates))))
+      (.then (fn [_] (paged-query! "directives-in-force" "celex" directives-in-force-query)))
+      (.then (fn [_]
+               (if (flag? "--skip-text")
+                 (log "text layer skipped (--skip-text)")
+                 (let [ids (celex-list)
+                       ids (if (pos? hard-limit) (take hard-limit ids) ids)]
+                   (log "fetching" (count ids) "directive texts with pool" pool-size)
+                   (-> (pooled pool-size ids
+                               (fn [c i]
+                                 (-> (fetch-text c)
+                                     (.then (fn [r]
+                                              (when (zero? (mod (inc i) 100))
+                                                (log "text progress" (inc i) "/" (count ids)))
+                                              r)))))
+                       (.then (fn [rs]
+                                (let [failed (filter :failed rs)]
+                                  (log "text done. fetched" (count (remove #(or (:failed %) (:skipped %)) rs))
+                                       "skipped" (count (filter :skipped rs))
+                                       "failed" (count failed))
+                                  (when (seq failed)
+                                    (log "FAILED:" (str/join "," (map :celex (take 40 failed)))))))))))))
+      (.catch (fn [e] (log "FATAL" (str e)) (set! (.-exitCode js/process) 1)))))
+
+(-main)
