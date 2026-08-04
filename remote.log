@@ -1,0 +1,1 @@
+2c6a92d4-7327-49d6-9aa3-275742dacf98 bucket=gftdcojp-m365-annex chunk=50MiB datacenter=US encryption=none fileprefix=eu.europa.eur-lex/ host=s3.us-west-004.backblazeb2.com name=b2 port=443 protocol=https signature=v4 storageclass=STANDARD type=S3 timestamp=1785832775s
