@@ -1,4 +1,4 @@
-#!/usr/bin/env nbb
+#!/usr/bin/env kbb
 ;; Preserves EUR-Lex / Cellar into raw/.
 ;;
 ;;   raw/sparql/metadata-<n>.json   — paged CELEX metadata (type, dates, ELI,
@@ -21,7 +21,7 @@
 ;; citation, not a dependency. Recorded as a known gap rather than silently
 ;; skipped.
 ;;
-;; Usage: nbb --classpath bin bin/fetch.cljk [--pool N] [--limit N] [--skip-text]
+;; Usage: kbb --backend sci --classpath bin bin/fetch.cljk [--pool N] [--limit N] [--skip-text]
 (ns fetch
   (:require [lib :refer [fetch-buffer log mkdirp! exists? write-file! pooled
                          sleep file-size]]
