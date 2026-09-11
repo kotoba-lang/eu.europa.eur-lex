@@ -50,6 +50,6 @@ EUR-Lex は法令間の関係を **RDF の述語として明示的に持って�
 ## 再取得 / 再生成
 
 ```bash
-nbb --classpath bin bin/fetch.cljs --pool 5   # SPARQL ページ + 指令本文（ページ単位で再開可）
-nbb --classpath bin bin/index.cljs            # index/ と raw/source-catalog.edn
+nbb --classpath bin bin/fetch.cljk --pool 5   # SPARQL ページ + 指令本文（ページ単位で再開可）
+nbb --classpath bin bin/index.cljk            # index/ と raw/source-catalog.edn
 ```
