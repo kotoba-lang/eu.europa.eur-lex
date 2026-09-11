@@ -21,7 +21,7 @@
 ;; citation, not a dependency. Recorded as a known gap rather than silently
 ;; skipped.
 ;;
-;; Usage: nbb --classpath bin bin/fetch.cljs [--pool N] [--limit N] [--skip-text]
+;; Usage: nbb --classpath bin bin/fetch.cljk [--pool N] [--limit N] [--skip-text]
 (ns fetch
   (:require [lib :refer [fetch-buffer log mkdirp! exists? write-file! pooled
                          sleep file-size]]
