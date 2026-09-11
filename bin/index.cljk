@@ -1,11 +1,11 @@
-#!/usr/bin/env nbb
+#!/usr/bin/env kbb
 ;; Derives index/ (small, git-tracked) from raw/ (large, annexed).
 ;;
 ;;   index/laws.edn       — one row per in-force CELEX act
 ;;   index/relations.edn  — the structural act-to-act dependency edges
 ;;   raw/source-catalog.edn — sha256 of every preserved file
 ;;
-;; Usage: nbb --classpath bin bin/index.cljk
+;; Usage: kbb --backend sci --classpath bin bin/index.cljk
 (ns index
   (:require [lib :refer [log write-edn! sha256-file file-size mkdirp!]]
             [clojure.string :as str]))
